@@ -1,6 +1,6 @@
 repos:
   - repo: https://github.com/Tesla2000/AntimagicField
-    rev: v0.1.6-alpha
+    rev: v0.1.7-alpha
     hooks:
       - id: antimagic_field
         require_serial: true
