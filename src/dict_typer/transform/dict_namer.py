@@ -8,7 +8,6 @@ from collections.abc import Sequence
 from types import ModuleType
 from typing import Any
 from typing import Callable
-from typing import Literal
 from typing import TypeVar
 from typing import Union
 
@@ -39,7 +38,6 @@ T = TypeVar("T", bound=CSTNode)
 
 types = (int, float, str, bool, list, dict, set, tuple, Callable, Any)
 
-type_hints = Literal[*(type.__name__ for type in types)]
 imported_types = tuple(type for type in types if type.__module__ != "builtins")
 
 
@@ -69,7 +67,7 @@ class DictNamer(Transformer):
             "typed_dict_data",
             typed_dict_name=str,
             typed_dict_keys=list[str],
-            typed_dict_type_hints=list[type_hints],
+            typed_dict_type_hints=list[str],
             explanation=str,
         )
         if not json.loads(
@@ -116,9 +114,12 @@ class DictNamer(Transformer):
                 imported_types.__contains__,
                 (
                     next(
-                        imported_type
-                        for imported_type in types
-                        if imported_type.__name__ == hint
+                        (
+                            imported_type
+                            for imported_type in types
+                            if imported_type.__name__ == hint
+                        ),
+                        None,
                     )
                     for hint in typed_dict_type_hints
                 ),
