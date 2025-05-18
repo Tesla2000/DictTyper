@@ -6,8 +6,10 @@ repos:
         require_serial: true
         stages: [manual]
         args:
+          - --ai_model
+          - gpt-4o
           - --formatting
-          - black {filepaths} --preview --line-length 79 reorder-python-imports {filepaths} --py37-plus --add-import 'from __future__ import annotations' --py39-plus
+          - black {filepaths} --preview --line-length 79\nreorder-python-imports {filepaths} --py37-plus --add-import 'from __future__ import annotations' --py39-plus
           - --suppress_fail
           - "True"
   - repo: https://github.com/Tesla2000/TupleNamer
