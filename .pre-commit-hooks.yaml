@@ -1,0 +1,7 @@
+-   id: dict_typer
+    name: DictTyper
+    description: Converts dict type hint to more specific TypedDict
+    entry: dict_typer
+    language: python
+    types: [python]
+    files: ''

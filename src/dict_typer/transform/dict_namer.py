@@ -1,0 +1,212 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import typing
+from typing import Literal
+from typing import TypeVar
+
+import libcst
+import mypy_extensions
+import typing_extensions
+from libcst import Annotation
+from libcst import CSTNode
+from libcst import Ellipsis as LibcstEllipsis
+from libcst import FunctionDef
+from libcst import Import
+from libcst import ImportAlias
+from libcst import ImportFrom
+from libcst import Module
+from libcst import Name
+from libcst import SimpleStatementLine
+from libcst import Subscript
+from litellm import completion
+from more_itertools import last
+from pydantic import create_model
+
+from ..config import Config
+from ._transformer import Transformer
+
+T = TypeVar("T", bound=CSTNode)
+
+
+type_hints = Literal[
+    "int",
+    "float",
+    "str",
+    "bool",
+    "list",
+    "dict",
+    "set",
+    "tuple",
+    "Callable",
+    "Any",
+]
+
+
+class DictNamer(Transformer):
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self.modified_returns: dict[FunctionDef, str] = {}
+
+    def leave_FunctionDef(
+        self, original_node: "FunctionDef", updated_node: "FunctionDef"
+    ) -> "FunctionDef":
+        if updated_node.returns is None or self.in_cache(updated_node):
+            return updated_node
+        annotation = updated_node.returns.annotation
+        if not (
+            isinstance(annotation, Subscript)
+            and isinstance(value := annotation.value, Name)
+            and value.value == "dict"
+            and (
+                len(slice := annotation.slice) < 2
+                or not isinstance(slice[1].slice.value, LibcstEllipsis)
+            )
+        ):
+            return updated_node
+        model = create_model(
+            "typed_dict_data",
+            typed_dict_name=str,
+            typed_dict_keys=list[str],
+            typed_dict_type_hints=list[type_hints],
+            explanation=str,
+        )
+        if not json.loads(
+            completion(
+                "anthropic/claude-3-5-sonnet-20240620",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Can return value of this function be replaced with a TypedDict. True if the keys are hardcoded, False otherwise."
+                            "\nExample: True if\ndef foo():\n\treturn {'foo': 'bar'}"
+                            "\nExample: True if\ndef foo():\n\treturn dict(foo=bar)"
+                            "\nExample: False if\ndef foo(kwargs):\n\treturn dict(kwargs)"
+                            "\nExample: False if\ndef foo(kwargs):\n\treturn {}"
+                            + Module([original_node]).code
+                        ),
+                    }
+                ],
+                temperature=0.0,
+                response_format=create_model("CanBeTypedDict", can_be=bool),
+            ).choices[0]["message"]["content"]
+        )["can_be"]:
+            self.save2cache(updated_node)
+            return updated_node
+        response = json.loads(
+            completion(
+                "anthropic/claude-3-5-sonnet-20240620",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "You job is to replace return value of the function with a TypedDict if it is possible. "
+                            "Peak the value in the way that you are 100% sure that the return value matches the typed dict that you propose. "
+                            "Peak suitable field names for the typed dict's fields which represent keys of the dict, types hints which represent type of values and the name of the typeddict that is a return value of the function bellow. "
+                            "Return only key names that are present as strings or kwargs in the code."
+                            "Note field names must be single word or words connected with _:\n"
+                            + Module([original_node]).code
+                        ),
+                    }
+                ],
+                temperature=0.0,
+                response_format=model,
+            ).choices[0]["message"]["content"]
+        )
+        typed_dict_name = "_" + response["typed_dict_name"].lstrip("_")
+        updated_node = updated_node.with_changes(
+            returns=Annotation(annotation=Name(typed_dict_name))
+        )
+        typed_dict_keys = response["typed_dict_keys"]
+        typed_dict_type_hints = response["typed_dict_type_hints"]
+        assert len(typed_dict_keys) == len(typed_dict_type_hints)
+        self.modified_returns[updated_node] = (
+            f"class {typed_dict_name}({typing.TypedDict.__name__}):"
+            + "".join(
+                map(
+                    "\n\t{}: {}".format, typed_dict_keys, typed_dict_type_hints
+                )
+            )
+        )
+        self.save2cache(updated_node)
+        return updated_node
+
+    def leave_Module(
+        self, original_node: "Module", updated_node: "Module"
+    ) -> "Module":
+        body = list(updated_node.body)
+        if self.modified_returns and not any(
+            map(
+                lambda elem: isinstance(elem, SimpleStatementLine)
+                and isinstance(import_ := elem.body[0], ImportFrom)
+                and import_.module.value
+                in (
+                    typing.__name__,
+                    typing_extensions.__name__,
+                    mypy_extensions.__name__,
+                )
+                and any(
+                    alias.name.value == typing.TypedDict.__name__
+                    for alias in import_.names
+                ),
+                body,
+            )
+        ):
+            body.insert(
+                0,
+                SimpleStatementLine(
+                    [
+                        ImportFrom(
+                            Name(typing.__name__),
+                            [ImportAlias(Name(typing.TypedDict.__name__))],
+                        )
+                    ]
+                ),
+            )
+        updated_node = updated_node.with_changes(body=tuple(body))
+        return self._add_typed_dict(original_node, updated_node)
+
+    def _add_typed_dict(self, _: T, updated_node: T) -> T:
+        if self.modified_returns:
+            body = list(updated_node.body)
+            for func in filter(
+                dict(self.modified_returns).get, updated_node.body
+            ):
+                body.insert(
+                    body.index(func),
+                    libcst.parse_statement(self.modified_returns.pop(func)),
+                )
+            import_index = (
+                body.index(
+                    last(
+                        filter(
+                            lambda elem: isinstance(elem, SimpleStatementLine)
+                            and isinstance(elem.body[0], (ImportFrom, Import)),
+                            body,
+                        )
+                    )
+                )
+                + 1
+            )
+            for value in self.modified_returns.values():
+                body.insert(import_index, libcst.parse_statement(value))
+            return updated_node.with_changes(body=tuple(body))
+        return updated_node
+
+    def save2cache(self, function: FunctionDef) -> None:
+        cache = self._get_cache()
+        cache[self._get_hash(function)] = True
+        self.config.dict_typer_cache.write_text(json.dumps(cache, indent=2))
+
+    def in_cache(self, function: FunctionDef) -> bool:
+        return self._get_hash(function) in self._get_cache()
+
+    def _get_cache(self):
+        if not self.config.dict_typer_cache.exists():
+            return {}
+        return json.loads(self.config.dict_typer_cache.read_bytes())
+
+    @staticmethod
+    def _get_hash(function: FunctionDef):
+        return hashlib.md5(Module([function]).code.encode()).hexdigest()
