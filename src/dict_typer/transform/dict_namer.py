@@ -13,7 +13,6 @@ from typing import TypeVar
 from typing import Union
 
 import libcst
-import mypy_extensions
 import typing_extensions
 from libcst import Annotation
 from libcst import BaseCompoundStatement
@@ -144,7 +143,6 @@ class DictNamer(Transformer):
             (
                 typing.__name__,
                 typing_extensions.__name__,
-                mypy_extensions.__name__,
             ),
             typing.TypedDict.__name__,
         ):
