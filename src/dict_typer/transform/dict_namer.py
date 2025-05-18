@@ -3,13 +3,20 @@ from __future__ import annotations
 import hashlib
 import json
 import typing
+from collections.abc import Container
+from collections.abc import Sequence
+from types import ModuleType
+from typing import Any
+from typing import Callable
 from typing import Literal
 from typing import TypeVar
+from typing import Union
 
 import libcst
 import mypy_extensions
 import typing_extensions
 from libcst import Annotation
+from libcst import BaseCompoundStatement
 from libcst import CSTNode
 from libcst import Ellipsis as LibcstEllipsis
 from libcst import FunctionDef
@@ -29,25 +36,17 @@ from ._transformer import Transformer
 
 T = TypeVar("T", bound=CSTNode)
 
+types = (int, float, str, bool, list, dict, set, tuple, Callable, Any)
 
-type_hints = Literal[
-    "int",
-    "float",
-    "str",
-    "bool",
-    "list",
-    "dict",
-    "set",
-    "tuple",
-    "Callable",
-    "Any",
-]
+type_hints = Literal[*(type.__name__ for type in types)]
+imported_types = tuple(type for type in types if type.__module__ != "builtins")
 
 
 class DictNamer(Transformer):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self.modified_returns: dict[FunctionDef, str] = {}
+        self.imported_types: set[ModuleType] = set()
 
     def leave_FunctionDef(
         self, original_node: "FunctionDef", updated_node: "FunctionDef"
@@ -121,6 +120,19 @@ class DictNamer(Transformer):
         typed_dict_keys = response["typed_dict_keys"]
         typed_dict_type_hints = response["typed_dict_type_hints"]
         assert len(typed_dict_keys) == len(typed_dict_type_hints)
+        self.imported_types.update(
+            filter(
+                imported_types.__contains__,
+                (
+                    next(
+                        imported_type
+                        for imported_type in types
+                        if imported_type.__name__ == hint
+                    )
+                    for hint in typed_dict_type_hints
+                ),
+            )
+        )
         self.modified_returns[updated_node] = (
             f"class {typed_dict_name}({typing.TypedDict.__name__}):"
             + "".join(
@@ -129,29 +141,20 @@ class DictNamer(Transformer):
                 )
             )
         )
-        self.save2cache(updated_node)
         return updated_node
 
     def leave_Module(
         self, original_node: "Module", updated_node: "Module"
     ) -> "Module":
         body = list(updated_node.body)
-        if self.modified_returns and not any(
-            map(
-                lambda elem: isinstance(elem, SimpleStatementLine)
-                and isinstance(import_ := elem.body[0], ImportFrom)
-                and import_.module.value
-                in (
-                    typing.__name__,
-                    typing_extensions.__name__,
-                    mypy_extensions.__name__,
-                )
-                and any(
-                    alias.name.value == typing.TypedDict.__name__
-                    for alias in import_.names
-                ),
-                body,
-            )
+        if self.modified_returns and not self._is_import_present(
+            body,
+            (
+                typing.__name__,
+                typing_extensions.__name__,
+                mypy_extensions.__name__,
+            ),
+            typing.TypedDict.__name__,
         ):
             body.insert(
                 0,
@@ -164,8 +167,51 @@ class DictNamer(Transformer):
                     ]
                 ),
             )
+        for type_ in self.imported_types:
+            if self._is_import_present(
+                body, (type_.__module__,), type_.__name__
+            ):
+                continue
+            body.insert(
+                0,
+                SimpleStatementLine(
+                    [
+                        ImportFrom(
+                            Name(type_.__module__),
+                            [ImportAlias(Name(type_.__name__))],
+                        )
+                    ]
+                ),
+            )
+
         updated_node = updated_node.with_changes(body=tuple(body))
         return self._add_typed_dict(original_node, updated_node)
+
+    @staticmethod
+    def _is_import_present(
+        body: Sequence[Union[SimpleStatementLine, BaseCompoundStatement]],
+        module_names: Container[str],
+        imported_elem: str,
+    ) -> bool:
+
+        def _is_specific_import(
+            elem: Union[SimpleStatementLine, BaseCompoundStatement],
+        ) -> bool:
+            if not isinstance(elem, SimpleStatementLine):
+                return False
+            import_ = elem.body[0]
+            if not isinstance(import_, ImportFrom):
+                return False
+            return import_.module.value in module_names and any(
+                alias.name.value == imported_elem for alias in import_.names
+            )
+
+        return any(
+            map(
+                _is_specific_import,
+                body,
+            )
+        )
 
     def _add_typed_dict(self, _: T, updated_node: T) -> T:
         if self.modified_returns:
